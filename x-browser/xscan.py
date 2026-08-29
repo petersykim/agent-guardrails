@@ -64,17 +64,41 @@ BLOCKED_JS = r"""
 """
 
 
+def open_background_tab(port, url='about:blank'):
+    """Create a tab WITHOUT foregrounding it, and return its target id.
+
+    Target.createTarget with background=True instead of PUT /json/new: a
+    foreground tab RESTORES the minimized clone window onto Peter's desktop
+    (measured 2026-08-28); a background one does not. The target id doubles
+    as the /json id, so /json/close/<id> and /devtools/page/<id> both work.
+    """
+    ver = json.load(urllib.request.urlopen(
+        f'http://127.0.0.1:{port}/json/version'))
+    bws = create_connection(ver['webSocketDebuggerUrl'], timeout=60,
+                            origin=f'http://localhost:{port}')
+    try:
+        bws.send(json.dumps({'id': 1, 'method': 'Target.createTarget',
+                             'params': {'url': url, 'background': True}}))
+        while True:
+            m = json.loads(bws.recv())
+            if m.get('id') == 1:
+                if 'error' in m:
+                    raise RuntimeError(
+                        f'Target.createTarget failed: {m["error"]}')
+                return m['result']['targetId']
+    finally:
+        bws.close()
+
+
 class Tab:
     def __init__(self, port):
         self.port = port
-        info = json.load(urllib.request.urlopen(
-            urllib.request.Request(f'http://127.0.0.1:{port}/json/new?about:blank',
-                                   method='PUT')))
-        self.id = info['id']
+        self.id = open_background_tab(port)
         self.seq = 0
         try:
-            self.ws = create_connection(info['webSocketDebuggerUrl'], timeout=60,
-                                        origin=f'http://localhost:{port}')
+            self.ws = create_connection(
+                f'ws://127.0.0.1:{port}/devtools/page/{self.id}', timeout=60,
+                origin=f'http://localhost:{port}')
         except Exception:
             self._close_rest()
             raise
