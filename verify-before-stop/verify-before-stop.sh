@@ -1,85 +1,67 @@
 #!/usr/bin/env bash
-# Stop-hook gate: an agent cannot end its turn on an unverified claim of "done."
-# Reads Claude Code's Stop-hook JSON on stdin, checks the deliverable this run
-# was configured to produce, and either allows the stop or blocks it with the
-# specific claim that failed.
+# verify-before-stop.sh -- Stop hook that blocks an agent from ending its
+# turn on a bare claim of "done". Before the stop is allowed, it checks
+# that a git diff exists against the claimed files, that a named test
+# command actually ran and exited 0, and that any file the task claims to
+# have written is present on disk (optionally containing a required
+# string). Any check can be skipped by leaving its variable unset.
 #
-# Configure via environment (set in settings.json, see README):
-#   VERIFY_TEST_CMD          shell command that must exit 0 (e.g. "npm test")
-#   VERIFY_DIFF_PATHS        space-separated paths that must show a git diff
-#                             against HEAD (files the task claimed to change)
-#   VERIFY_DELIVERABLE_FILES space-separated files that must exist and be
-#                             non-empty (files the task claimed to write)
-#   VERIFY_DELIVERABLE_GREP  optional string that must appear in every file
-#                             listed in VERIFY_DELIVERABLE_FILES
-#
-# Any variable left unset skips that check. Unset all four and the hook is a
-# no-op that always allows the stop.
+# Wire into the Stop event. Reads the hook payload as JSON on stdin,
+# writes the failing checks to stderr, and exits 2 to block or 0 to allow.
+set -uo pipefail
 
-set -u
+INPUT=$(cat)
 
-input="$(cat)"
-
-# Stop hooks can be re-invoked after they already blocked once this turn.
-# Refusing a second time risks an infinite loop, so on the replay we allow.
-stop_hook_active="$(printf '%s' "$input" | grep -o '"stop_hook_active"[[:space:]]*:[[:space:]]*true' || true)"
-if [ -n "$stop_hook_active" ]; then
-  exit 0
+# Claude Code sets stop_hook_active=true when this hook already blocked
+# once for the current stop attempt. Allow the stop on the second pass so
+# one unmet check can't trap the session in a retry loop.
+if command -v jq >/dev/null 2>&1; then
+  STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null)
+else
+  # No jq on this machine: fall back to a grep parse of the flat JSON field.
+  STOP_HOOK_ACTIVE=$(echo "$INPUT" | grep -o '"stop_hook_active"[[:space:]]*:[[:space:]]*true' >/dev/null && echo true || echo false)
 fi
+[ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
 
-fail_reasons=()
+FAILURES=()
 
-# 1. Diff check: the claimed files must actually differ from HEAD.
+# 1. A diff must actually exist against the paths the task claimed to touch.
 if [ -n "${VERIFY_DIFF_PATHS:-}" ]; then
   for path in $VERIFY_DIFF_PATHS; do
-    if [ ! -e "$path" ]; then
-      fail_reasons+=("claimed file does not exist: $path")
-      continue
-    fi
-    if git diff --quiet -- "$path" 2>/dev/null && git diff --cached --quiet -- "$path" 2>/dev/null; then
-      fail_reasons+=("no diff against HEAD for claimed file: $path")
+    if [ -z "$(git diff --name-only -- "$path" 2>/dev/null)" ] && \
+       [ -z "$(git diff --cached --name-only -- "$path" 2>/dev/null)" ]; then
+      FAILURES+=("no diff found against $path")
     fi
   done
 fi
 
-# 2. Test check: the named test command must actually run and pass.
+# 2. The project's own test command must run and pass.
 if [ -n "${VERIFY_TEST_CMD:-}" ]; then
-  if ! eval "$VERIFY_TEST_CMD" >/tmp/verify-before-stop.log 2>&1; then
-    tail_lines="$(tail -n 5 /tmp/verify-before-stop.log 2>/dev/null)"
-    fail_reasons+=("test command failed: ${VERIFY_TEST_CMD} (last lines: ${tail_lines})")
+  if ! bash -c "$VERIFY_TEST_CMD" >/tmp/verify-before-stop.log 2>&1; then
+    FAILURES+=("test command failed: $VERIFY_TEST_CMD (see /tmp/verify-before-stop.log)")
   fi
 fi
 
-# 3. Deliverable check: files claimed as written must exist on disk, non-empty,
-#    and (optionally) contain the expected content.
+# 3. Any claimed deliverable file must exist, and optionally contain a
+#    required string.
 if [ -n "${VERIFY_DELIVERABLE_FILES:-}" ]; then
-  for f in $VERIFY_DELIVERABLE_FILES; do
-    if [ ! -s "$f" ]; then
-      fail_reasons+=("claimed deliverable missing or empty: $f")
-      continue
-    fi
-    if [ -n "${VERIFY_DELIVERABLE_GREP:-}" ]; then
-      if ! grep -q -- "$VERIFY_DELIVERABLE_GREP" "$f" 2>/dev/null; then
-        fail_reasons+=("deliverable $f does not contain expected content: $VERIFY_DELIVERABLE_GREP")
-      fi
+  for file in $VERIFY_DELIVERABLE_FILES; do
+    if [ ! -f "$file" ]; then
+      FAILURES+=("deliverable missing: $file")
+    elif [ -n "${VERIFY_DELIVERABLE_GREP:-}" ] && ! grep -q "$VERIFY_DELIVERABLE_GREP" "$file"; then
+      FAILURES+=("deliverable $file does not contain: $VERIFY_DELIVERABLE_GREP")
     fi
   done
 fi
 
-if [ "${#fail_reasons[@]}" -eq 0 ]; then
+if [ "${#FAILURES[@]}" -eq 0 ]; then
   exit 0
 fi
 
-reason="Stop blocked, unverified claims of done:"
-for r in "${fail_reasons[@]}"; do
-  reason="$reason
-- $r"
-done
-
-json_reason="$(printf '%s' "$reason" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)"
-if [ -z "$json_reason" ]; then
-  json_reason="\"$reason\""
-fi
-
-printf '{"decision": "block", "reason": %s}\n' "$json_reason"
-exit 0
+{
+  echo "Blocked: this stop was not verified."
+  for f in "${FAILURES[@]}"; do
+    echo "- $f"
+  done
+} >&2
+exit 2
